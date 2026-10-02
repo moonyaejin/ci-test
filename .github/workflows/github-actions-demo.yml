@@ -2,9 +2,9 @@ name: CI/CD
 
 on:
   push:
-    branches: [master, container]
+    branches: [main, container]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 jobs:
   build-and-push:
@@ -50,7 +50,7 @@ jobs:
 
   deploy:
     needs: build-and-push
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
