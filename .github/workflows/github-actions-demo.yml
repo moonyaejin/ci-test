@@ -1,110 +1,56 @@
-name: CI/CD
-
-on:
-  push:
-    branches: [main, container]
-  pull_request:
-    branches: [main]
-
+name: Likelion CI/CD Test
+run-name: ${{ github.actor }} is testing out GitHub Actions
+on: [push]
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.version.outputs.version }}
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Generate version
-        id: version
-        run: |
-          echo "version=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push Docker image
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ steps.version.outputs.version }}
+          AWS_SSH_KEY: ${{ secrets.AWS_SSH_KEY }}
+          EC2_PUBLIC_IP: ${{ secrets.EC2_PUBLIC_IP }}
         run: |
-          # buildx 설정
-          docker buildx create --name mybuilder --use
-          docker buildx inspect --bootstrap
-
-          # 멀티 플랫폼 빌드 및 푸시
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
-            --push .
-
-  deploy:
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Create SSH directory
-        run: mkdir -p ~/.ssh
-
-      - name: Add SSH key
-        run: |
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-
-      - name: Add EC2 host to known_hosts
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-        run: |
-          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+          mkdir -p ~/.ssh/
+          echo "$AWS_SSH_KEY" > ~/.ssh/aws.key
+          chmod 600 ~/.ssh/aws.key
+          ssh-keyscan -H $EC2_PUBLIC_IP >> ~/.ssh/known_hosts
 
       - name: Deploy to EC2
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          EC2_PUBLIC_IP: ${{ secrets.EC2_PUBLIC_IP }}
+          EC2_USER: ec2-user
         run: |
-          # 디버깅을 위한 환경 변수 출력
-          echo "ECR_REGISTRY: ${ECR_REGISTRY}"
-          echo "ECR_REPOSITORY: ${ECR_REPOSITORY}"
-          echo "IMAGE_TAG: ${IMAGE_TAG}"
-          echo "전체 이미지 경로: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          # Create target directory on EC2
+          ssh -i ~/.ssh/aws.key $EC2_USER@$EC2_PUBLIC_IP "mkdir -p ~/sample-server"
 
-          # AWS 자격 증명 파일 생성 및 전송
-          ssh -i ~/.ssh/id_rsa $EC2_USERNAME@$EC2_HOST "mkdir -p ~/.aws"
-          echo "[default]
-          aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          region=${{ secrets.AWS_REGION }}" | ssh -i ~/.ssh/id_rsa $EC2_USERNAME@$EC2_HOST "cat > ~/.aws/credentials"
+          # Copy necessary files to EC2
+          scp -i ~/.ssh/aws.key -r \
+            dist/ \
+            package.json \
+            tsconfig.json \
+            tsconfig.build.json \
+            $EC2_USER@$EC2_PUBLIC_IP:~/sample-server
 
-          # 도커 명령어 실행
-          ssh -i ~/.ssh/id_rsa $EC2_USERNAME@$EC2_HOST "\
-            source ~/.bashrc && \
-            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${ECR_REGISTRY} && \
-            docker pull ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} && \
-            docker rm -f ci-test || true && \
-            docker run -d --name ci-test -p 3000:3000 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} && \
-            docker image prune -a -f"
+          # SSH into EC2 and restart the application
+          ssh -i ~/.ssh/aws.key $EC2_USER@$EC2_PUBLIC_IP << 'ENDSSH'
+            cd ~/sample-server
+            npm install
+            pm2 stop all || true
+            pm2 start dist/main.js --name "ci-test"
+          ENDSSH
+
+      - run: echo "🍏 This job's status is ${{ job.status }}."
