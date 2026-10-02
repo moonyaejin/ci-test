@@ -1,26 +1,110 @@
-name: CI
-run-name: ${{ github.actor }} is building ${{ github.ref_name }} 🚀
-on: [push]
+name: CI/CD
+
+on:
+  push:
+    branches: [master, container]
+  pull_request:
+    branches: [master]
+
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.version.outputs.version }}
+
     steps:
-      - name: Check out repository code
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
+      - name: Generate version
+        id: version
+        run: |
+          echo "version=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          node-version: 24
-          cache: npm
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build
-        run: npm run build
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.version.outputs.version }}
+        run: |
+          # buildx 설정
+          docker buildx create --name mybuilder --use
+          docker buildx inspect --bootstrap
 
-      - name: Run tests
-        run: npm test
+          # 멀티 플랫폼 빌드 및 푸시
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --push .
 
-      - run: echo "🍏 This job's status is ${{ job.status }}."
+  deploy:
+    needs: build-and-push
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create SSH directory
+        run: mkdir -p ~/.ssh
+
+      - name: Add SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Add EC2 host to known_hosts
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          # 디버깅을 위한 환경 변수 출력
+          echo "ECR_REGISTRY: ${ECR_REGISTRY}"
+          echo "ECR_REPOSITORY: ${ECR_REPOSITORY}"
+          echo "IMAGE_TAG: ${IMAGE_TAG}"
+          echo "전체 이미지 경로: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          # AWS 자격 증명 파일 생성 및 전송
+          ssh -i ~/.ssh/id_rsa $EC2_USERNAME@$EC2_HOST "mkdir -p ~/.aws"
+          echo "[default]
+          aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region=${{ secrets.AWS_REGION }}" | ssh -i ~/.ssh/id_rsa $EC2_USERNAME@$EC2_HOST "cat > ~/.aws/credentials"
+
+          # 도커 명령어 실행
+          ssh -i ~/.ssh/id_rsa $EC2_USERNAME@$EC2_HOST "\
+            source ~/.bashrc && \
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${ECR_REGISTRY} && \
+            docker pull ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} && \
+            docker rm -f ci-test || true && \
+            docker run -d --name ci-test -p 3000:3000 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} && \
+            docker image prune -a -f"
